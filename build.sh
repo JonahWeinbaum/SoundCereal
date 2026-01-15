@@ -1,0 +1,1 @@
+javac   --patch-module java.base=jdk-patch   --add-exports java.base/jdk.internal.misc=ALL-UNNAMED   --add-exports java.base/jdk.internal.reflect=ALL-UNNAMED   --add-exports java.base/sun.reflect.misc=ALL-UNNAMED   -d out   jdk-patch/java/io/ObjectInputStream.java
