@@ -46,7 +46,7 @@ import jdk.internal.util.ByteArray;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-
+import java.util.Stack;
 /**
  * An ObjectInputStream deserializes primitive data and objects previously
  * written using an ObjectOutputStream.
@@ -283,6 +283,7 @@ public class ObjectInputStream
     private static final int NULL_HANDLE = -1;
 
     public AstNode root;
+    Stack<AstNode> parseStack = new Stack<>();; 
     
     /** marker for unshared objects in internal handle table */
     private static final Object unsharedMarker = new Object();
@@ -1611,9 +1612,13 @@ public class ObjectInputStream
             bin.setBlockDataMode(false);
         }
 
+	this.parseStack.push(AstNode.node(StreamToken.CONTENT));
+	this.root.addChild(this.parseStack.peek());
+	
         byte tc;
         while ((tc = bin.peekByte()) == TC_RESET) {
             bin.readByte();
+	    this.parseStack.pop().addChild(AstNode.node(StreamToken.TC_RESET));
             handleReset();
         }
 
@@ -1661,6 +1666,9 @@ public class ObjectInputStream
                     if (type == String.class) {
                         throw new ClassCastException("Cannot cast an object to java.lang.String");
                     }
+		    AstNode objNode = AstNode.node(StreamToken.TC_OBJECT);
+		    this.parseStack.peek().addChild(objNode);
+		    this.parseStack.push(objNode);
                     return checkResolve(readOrdinaryObject(unshared));
 
                 case TC_EXCEPTION:
@@ -1767,6 +1775,9 @@ public class ObjectInputStream
         if (bin.readByte() != TC_REFERENCE) {
             throw new InternalError();
         }
+
+	this.parseStack.peek().addChild(AstNode.node(StreamToken.TC_REFERENCE));
+	
         passHandle = bin.readInt() - baseWireHandle;
         if (passHandle < 0 || passHandle >= handles.size()) {
             throw new StreamCorruptedException(
@@ -1799,6 +1810,8 @@ public class ObjectInputStream
         if (bin.readByte() != TC_CLASS) {
             throw new InternalError();
         }
+	this.parseStack.peek().addChild(AstNode.node(StreamToken.TC_CLASS));
+	// this.parseStack.push(AstNode.node(StreamToken.
         ObjectStreamClass desc = readClassDesc(false);
         Class<?> cl = desc.forClass();
         passHandle = handles.assign(unshared ? unsharedMarker : cl);
@@ -1821,6 +1834,7 @@ public class ObjectInputStream
     private ObjectStreamClass readClassDesc(boolean unshared)
         throws IOException
     {
+	
         byte tc = bin.peekByte();
 
         return switch (tc) {
@@ -1847,6 +1861,8 @@ public class ObjectInputStream
     private ObjectStreamClass readProxyDesc(boolean unshared)
         throws IOException
     {
+	this.parseStack.peek().addChild(AstNode.node(StreamToken.TC_PROXYCLASSDESC));
+	
         if (bin.readByte() != TC_PROXYCLASSDESC) {
             throw new InternalError();
         }
@@ -1937,6 +1953,10 @@ public class ObjectInputStream
             throw new InternalError();
         }
 
+	AstNode classDesc = AstNode.node(StreamToken.TC_CLASSDESC);
+	this.parseStack.peek().addChild(classDesc);
+	this.parseStack.push(classDesc);
+
         ObjectStreamClass desc = new ObjectStreamClass();
         int descHandle = handles.assign(unshared ? unsharedMarker : desc);
         passHandle = NULL_HANDLE;
@@ -1949,6 +1969,21 @@ public class ObjectInputStream
                                             ex);
         }
 
+	AstNode className = AstNode.node(StreamToken.CLASS_NAME);
+	className.setValue(readDesc.getName());
+	this.parseStack.peek().addChild(className);
+
+ 	AstNode serialVersion = AstNode.node(StreamToken.SERIAL_VERSION);
+	serialVersion.setValue(readDesc.getSerialVersionUID());
+	this.parseStack.peek().addChild(serialVersion);
+
+	AstNode newHandle = AstNode.node(StreamToken.NEW_HANDLE);
+	newHandle.setValue(descHandle);
+	this.parseStack.peek().addChild(newHandle);
+
+	AstNode classDescInfo = AstNode.node(StreamToken.CLASS_DESC_INFO); 
+	this.parseStack.peek().addChild(classDescInfo);
+	this.parseStack.push(classDescInfo);
         Class<?> cl = null;
         ClassNotFoundException resolveEx = null;
         bin.setBlockDataMode(true);
@@ -2000,6 +2035,8 @@ public class ObjectInputStream
         handles.finish(descHandle);
         passHandle = descHandle;
 
+	this.parseStack.pop();
+	
         return desc;
     }
 
@@ -2009,12 +2046,25 @@ public class ObjectInputStream
      */
     private String readString(boolean unshared) throws IOException {
         byte tc = bin.readByte();
+
+	AstNode string = null; 
+	
+	switch (tc) {
+	    case TC_STRING:
+		string = AstNode.node(StreamToken.TC_STRING);
+	    case TC_LONGSTRING:
+		string = AstNode.node(StreamToken.TC_LONGSTRING);
+	    default:
+		break;
+	};
         String str = switch (tc) {
             case TC_STRING      -> bin.readUTF();
             case TC_LONGSTRING  -> bin.readLongUTF();
             default             -> throw new StreamCorruptedException(
                     String.format("invalid type code: %02X", tc));
         };
+	string.setValue('"' + str + '"');
+	this.parseStack.pop().addChild(string);
         passHandle = handles.assign(unshared ? unsharedMarker : str);
         handles.finish(passHandle);
         return str;
@@ -4084,24 +4134,36 @@ public class ObjectInputStream
         SharedSecrets.setJavaObjectInputStreamReadString(ObjectInputStream::readString);
     }
 
+    static enum ClassDescFlags {
+	SC_WRITE_METHOD,
+	SC_BLOCK_DATA,
+	SC_SERIALIZABLE,
+	SC_EXTERNALIZABLE,
+	SC_ENUM
+    }
+    
     static enum StreamToken {
 	CONTENTS,
 	CONTENT,
 	OBJECT,
 	BLOCKDATA,
+	CLASS_NAME,
 	NEW_OBJECT,
 	NEW_CLASS,
 	NEW_ARRAY,
 	NEW_STRING,
 	NEW_ENUM,
+	NEW_HANDLE, 
 	NEW_CLASSDESC,
-	CLASSDESC,
+	CLASS_DESC,
+	CLASS_DESC_INFO, 
 	CLASSDATA,
 	FIELDS,
 	FIELD_DESC,
 	VALUES,
 	OBJECT_ANNOTATION,
 	CLASS_ANNOTATION,
+	SERIAL_VERSION,
 	EXCEPTION,
 	STREAM,
 
@@ -4202,6 +4264,7 @@ public class ObjectInputStream
 	FileInputStream file = new FileInputStream("serialize.duh");
 	ObjectInputStream in = new ObjectInputStream(file);
 	Object obj = in.readObject();
+	obj = in.readObject();
 	System.out.print(in.root); 
 
     }
